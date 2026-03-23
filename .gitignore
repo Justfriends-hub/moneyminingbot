@@ -1,0 +1,42 @@
+# ── Python ────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+
+# ── Virtual environment ──────────────────────
+venv/
+.venv/
+ENV/
+
+# ── Environment / secrets ────────────────────
+.env
+*.env
+!.env.example
+
+# ── Database ─────────────────────────────────
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# ── Logs ─────────────────────────────────────
+*.log
+logs/
+
+# ── IDE / editor ─────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── OS ───────────────────────────────────────
+desktop.ini

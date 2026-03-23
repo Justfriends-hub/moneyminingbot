@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any
 
-from config import TradingConfig, StrategyConfig, RiskConfig
+from config import TradingConfig, StrategyConfig, RiskConfig, ExchangeConfig
 from exchange.bybit_client import BybitClient
 from exchange.paper_engine import PaperEngine
 from strategies.base_strategy import Signal
@@ -63,11 +63,30 @@ class TradeExecutor:
         self._active_pairs: List[str] = StrategyConfig.DEFAULT_PAIRS
         self._active_timeframe: str = StrategyConfig.DEFAULT_TIMEFRAME
 
+        # In-memory live position tracking: {trade_id: position_dict}
+        # Mirrors paper engine approach so live SL/TP can be monitored
+        self._live_positions: Dict[str, Dict[str, Any]] = {}
+        self._restore_live_positions()
+
         # Track last scan time to avoid redundant scans
         self._last_scan_ts: float = 0.0
         self._scan_interval: float = 60.0   # seconds between scans
 
         logger.info("[Executor] TradeExecutor initialised")
+
+    def _restore_live_positions(self):
+        """Restore open live trades from DB on restart."""
+        try:
+            open_trades = self.db.get_open_trades()
+            for trade in open_trades:
+                if not trade.get("is_paper"):
+                    self._live_positions[trade["trade_id"]] = trade
+            if self._live_positions:
+                logger.info(
+                    f"[Executor] Restored {len(self._live_positions)} open live position(s) from DB"
+                )
+        except Exception as e:
+            logger.warning(f"[Executor] Could not restore live positions: {e}")
 
     # ─────────────────────────────────────────
     # Settings control (called from Telegram)
@@ -216,6 +235,23 @@ class TradeExecutor:
         if not all_signals:
             return None
 
+        # ── Filter out short/sell signals on spot accounts ──
+        # Spot markets do not support shorting; only allow "buy" signals.
+        # This prevents live order failures and paper simulation of
+        # positions that could never be replicated on a real spot account.
+        spot_only = ExchangeConfig.EXCHANGE_ID == "bybit"  # spot by default
+        if spot_only:
+            long_signals = [s for s in all_signals if s.side == "buy"]
+            filtered_count = len(all_signals) - len(long_signals)
+            if filtered_count > 0:
+                logger.debug(
+                    f"[Executor] Filtered {filtered_count} short signal(s) — spot only"
+                )
+            all_signals = long_signals
+
+        if not all_signals:
+            return None
+
         # Return the highest-scoring signal
         all_signals.sort(key=lambda s: s.signal_score, reverse=True)
         best = all_signals[0]
@@ -282,7 +318,34 @@ class TradeExecutor:
                 quantity=quantity,
             )
             if order:
-                logger.info(f"[Executor] Live order placed: {order.get('id')}")
+                order_id = order.get('id', 'unknown')
+                trade_id = f"LIVE-{signal.pair.replace('/', '')}-{order_id[-8:]}"
+                fill_price = float(order.get('average', order.get('price', signal.entry_price)) or signal.entry_price)
+
+                trade = {
+                    "trade_id":       trade_id,
+                    "pair":           signal.pair,
+                    "side":           signal.side,
+                    "strategy":       signal.strategy,
+                    "timeframe":      signal.timeframe,
+                    "status":         "open",
+                    "entry_price":    fill_price,
+                    "stop_loss":      signal.stop_loss,
+                    "take_profit":    signal.take_profit,
+                    "quantity":       quantity,
+                    "position_value": fill_price * quantity,
+                    "signal_score":   signal.signal_score,
+                    "is_paper":       False,
+                    "opened_at":      utcnow_str(),
+                    "notes":          f"Live order {order_id} | Score: {signal.signal_score:.1f}",
+                }
+
+                self._live_positions[trade_id] = trade
+                self.db.save_trade(trade)
+                logger.info(f"[Executor] Live order placed & tracked: {order_id}")
+
+                if self.notifier:
+                    self.notifier.notify_trade_opened(trade)
             else:
                 logger.error("[Executor] Live order failed")
 
@@ -291,42 +354,153 @@ class TradeExecutor:
     # ─────────────────────────────────────────
 
     def _check_open_positions(self):
-        """Check all open positions for SL/TP hits."""
+        """Check all open positions for SL/TP hits (both paper and live)."""
         if TradingConfig.is_paper():
-            open_positions = self.paper.get_open_positions()
-            if not open_positions:
-                return
+            self._check_paper_positions()
+        else:
+            self._check_live_positions()
 
-            # Get current prices for all open pairs
-            current_prices: Dict[str, float] = {}
-            for pos in open_positions:
-                pair = pos["pair"]
-                if pair not in current_prices:
-                    try:
-                        price = self.exchange.get_current_price(pair)
-                        if price > 0:
-                            current_prices[pair] = price
-                    except Exception:
-                        pass
+    def _check_paper_positions(self):
+        """Monitor paper positions for SL/TP hits."""
+        open_positions = self.paper.get_open_positions()
+        if not open_positions:
+            return
 
-            # Check SL/TP
-            closed_trades = self.paper.check_sl_tp(current_prices)
+        current_prices: Dict[str, float] = {}
+        for pos in open_positions:
+            pair = pos["pair"]
+            if pair not in current_prices:
+                try:
+                    price = self.exchange.get_current_price(pair)
+                    if price > 0:
+                        current_prices[pair] = price
+                except Exception:
+                    pass
 
-            for trade in closed_trades:
-                is_win = trade.get("pnl", 0) > 0
-                self.risk.record_trade_result(is_win)
+        closed_trades = self.paper.check_sl_tp(current_prices)
 
-                if self.notifier:
-                    reason = trade.get("close_reason", "")
-                    if reason == "tp":
-                        self.notifier.notify_take_profit(trade)
-                    elif reason == "sl":
-                        self.notifier.notify_stop_loss(trade)
-                    else:
-                        self.notifier.notify_trade_closed(trade)
+        for trade in closed_trades:
+            is_win = trade.get("pnl", 0) > 0
+            self.risk.record_trade_result(is_win)
+
+            if self.notifier:
+                reason = trade.get("close_reason", "")
+                if reason == "tp":
+                    self.notifier.notify_take_profit(trade)
+                elif reason == "sl":
+                    self.notifier.notify_stop_loss(trade)
+                else:
+                    self.notifier.notify_trade_closed(trade)
+
+    def _check_live_positions(self):
+        """Monitor live positions for SL/TP hits and close via market orders."""
+        if not self._live_positions:
+            return
+
+        current_prices: Dict[str, float] = {}
+        for pos in list(self._live_positions.values()):
+            pair = pos["pair"]
+            if pair not in current_prices:
+                try:
+                    price = self.exchange.get_current_price(pair)
+                    if price > 0:
+                        current_prices[pair] = price
+                except Exception:
+                    pass
+
+        for trade_id, trade in list(self._live_positions.items()):
+            pair = trade["pair"]
+            price = current_prices.get(pair)
+            if price is None or price <= 0:
+                continue
+
+            side = trade["side"]
+            sl = trade["stop_loss"]
+            tp = trade["take_profit"]
+
+            hit_sl = (side == "buy" and price <= sl) or (side == "sell" and price >= sl)
+            hit_tp = (side == "buy" and price >= tp) or (side == "sell" and price <= tp)
+
+            if hit_tp or hit_sl:
+                close_reason = "tp" if hit_tp else "sl"
+                exit_price = tp if hit_tp else sl
+                self._close_live_position(trade_id, exit_price, close_reason)
+
+    def _close_live_position(
+        self, trade_id: str, exit_price: float, close_reason: str = "manual"
+    ) -> Optional[Dict]:
+        """Close a live position by placing a counter market order."""
+        trade = self._live_positions.get(trade_id)
+        if not trade:
+            return None
+
+        # Place the exit order (sell to close a buy, buy to close a sell)
+        close_side = "sell" if trade["side"] == "buy" else "buy"
+        try:
+            order = self.exchange.place_market_order(
+                pair=trade["pair"],
+                side=close_side,
+                quantity=trade["quantity"],
+            )
+            if not order:
+                logger.error(f"[Executor] Live close order failed for {trade_id}")
+                return None
+
+            fill_price = float(
+                order.get('average', order.get('price', exit_price)) or exit_price
+            )
+        except Exception as e:
+            logger.error(f"[Executor] Live close order error for {trade_id}: {e}")
+            return None
+
+        # Calculate P&L
+        entry = trade["entry_price"]
+        qty = trade["quantity"]
+        if trade["side"] == "buy":
+            pnl = (fill_price - entry) * qty
+        else:
+            pnl = (entry - fill_price) * qty
+
+        position_value = trade.get("position_value", entry * qty)
+        pnl_pct = (pnl / position_value) * 100.0 if position_value > 0 else 0.0
+
+        trade["status"] = "closed"
+        trade["exit_price"] = fill_price
+        trade["pnl"] = round(pnl, 4)
+        trade["pnl_pct"] = round(pnl_pct, 4)
+        trade["close_reason"] = close_reason
+        trade["closed_at"] = utcnow_str()
+
+        del self._live_positions[trade_id]
+
+        self.db.close_trade(
+            trade_id=trade_id,
+            exit_price=fill_price,
+            pnl=trade["pnl"],
+            pnl_pct=trade["pnl_pct"],
+            close_reason=close_reason,
+        )
+
+        is_win = pnl > 0
+        self.risk.record_trade_result(is_win)
+
+        logger.info(
+            f"[Executor] Live position closed: {trade['pair']} | "
+            f"PnL: ${pnl:.2f} ({pnl_pct:+.2f}%) | Reason: {close_reason}"
+        )
+
+        if self.notifier:
+            if close_reason == "tp":
+                self.notifier.notify_take_profit(trade)
+            elif close_reason == "sl":
+                self.notifier.notify_stop_loss(trade)
+            else:
+                self.notifier.notify_trade_closed(trade)
+
+        return trade
 
     def close_all_positions(self) -> List[Dict]:
-        """Emergency close all positions."""
+        """Emergency close all positions (paper and live)."""
         if TradingConfig.is_paper():
             open_positions = self.paper.get_open_positions()
             current_prices = {}
@@ -343,7 +517,21 @@ class TradeExecutor:
             for trade in closed:
                 self.risk.record_trade_result(trade.get("pnl", 0) > 0)
             return closed
-        return []
+        else:
+            # Live: close all tracked positions via market orders
+            closed = []
+            for trade_id in list(self._live_positions.keys()):
+                trade = self._live_positions[trade_id]
+                try:
+                    price = self.exchange.get_current_price(trade["pair"])
+                    if price <= 0:
+                        price = trade["entry_price"]
+                except Exception:
+                    price = trade["entry_price"]
+                result = self._close_live_position(trade_id, price, close_reason="closeall")
+                if result:
+                    closed.append(result)
+            return closed
 
     # ─────────────────────────────────────────
     # Manual single-pair scan (for /status)

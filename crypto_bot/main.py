@@ -173,7 +173,7 @@ async def main():
             logger.info("[Stop] Bot stopped cleanly.")
 
 
-def _daily_reset(paper: PaperEngine, notifier: Notifier, db: DatabaseManager, executor):
+async def _daily_reset(paper: PaperEngine, notifier: Notifier, db: DatabaseManager, executor):
     """Called at midnight UTC. Resets daily tracking."""
     logger.info("[Scheduler] Daily reset triggered")
     paper.reset_day_start_balance()
@@ -183,7 +183,7 @@ def _daily_reset(paper: PaperEngine, notifier: Notifier, db: DatabaseManager, ex
     logger.info(f"[Scheduler] New day started. Balance: {fmt_usd(paper.get_balance())}")
 
 
-def _send_daily_summary(paper: PaperEngine, notifier: Notifier, db: DatabaseManager):
+async def _send_daily_summary(paper: PaperEngine, notifier: Notifier, db: DatabaseManager):
     """Called at 23:55 UTC. Sends daily summary."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     trades = db.get_today_trades()

@@ -1,0 +1,21 @@
+services:
+  crypto-bot:
+    build: .
+    container_name: crypto-trading-bot
+    restart: unless-stopped
+    env_file:
+      - crypto_bot/.env
+    volumes:
+      # Persist database and logs across container restarts
+      - bot-data:/app/data
+    environment:
+      - DATABASE_PATH=/app/data/crypto_bot.db
+      - LOG_FILE=/app/data/bot.log
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  bot-data:
